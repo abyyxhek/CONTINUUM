@@ -205,6 +205,124 @@ type and key collapse to one external side effect regardless of argument drift.
 expose the same `key` / `key_fn` parameters, so the pattern applies uniformly
 across all three framework adapters.
 
+## Thin hook adapters
+
+Three further frameworks are covered without a class adapter, by
+`src/continuum/adapters/thin.py`. Each one hooks the framework's own tool-call
+surface, so agent construction code does not change, and none of them needs a
+CONTINUUM extra: install the framework itself and the hook surface is there.
+
+| Framework | Interception surface | Entry point |
+|:--|:--|:--|
+| CrewAI | global before/after tool-call hooks in `crewai.hooks` | `install_crewai_hooks(storage, run_id)` |
+| AutoGen core | `FunctionTool.run_json` wrapped in place | `wrap_autogen_tool(tool, storage, run_id)` |
+| Pydantic AI | async Hooks capability | `Agent(capabilities=[wrap_pydantic_ai_hooks(storage, run_id)])` |
+
+```python
+from continuum.adapters.thin import (
+    install_crewai_hooks,
+    wrap_autogen_tool,
+    wrap_pydantic_ai_hooks,
+)
+
+uninstall = install_crewai_hooks(store, "run_1")   # returns the uninstaller
+wrap_autogen_tool(tool, store, "run_1")            # same instance, run_json replaced
+hooks = wrap_pydantic_ai_hooks(store, "run_1")     # Agent(capabilities=[hooks])
+```
+
+All three route through one `ContinuumToolGuard` over the same `ActionLedger`:
+claim before the tool runs, complete after it returns, fail (certain) when it
+raises. Keys default to the MCP-style derivation (tool type, argument hash, run
+scope). `key_fn` gives the same resource-identity dedup the class adapters get,
+with a different signature: it is called as `key_fn(tool_name, args) -> str`,
+where `args` is the tool's argument dict, not the `(*args, **kwargs)` the
+`wrap_tool` decorators pass.
+
+Framework imports stay lazy, so importing `thin.py` costs nothing when the
+framework is absent. `install_crewai_hooks` raises `ImportError` with an install
+hint when `crewai` is not importable; the AutoGen and Pydantic AI helpers are
+duck-typed and never import their SDK at all.
+
+State written through these hooks carries `Origin.EXTERNAL_AGENT` provenance,
+because the framework asserts the facts, so such a run resolves to
+`request_human` until `continuum confirm` (see Provenance and the human gate
+below). Two further limits are worth knowing: `install_crewai_hooks` tracks only
+tool names in `action_types`, so pass `None` to track every call, and its
+uninstaller falls back to `clear_all_tool_call_hooks()` on older CrewAI
+versions, which drops other hooks with it.
+
+Tests: `tests/test_adapters_thin.py` covers the guard against a real ledger, the
+CrewAI before/after registry and its `action_types` filter, the AutoGen
+`run_json` claim/complete and its failure re-raise, and the Pydantic AI async
+capability on both the result and the error path. No SDK is required there
+either: each seam is exercised with a duck-typed stand-in, because what CONTINUUM
+depends on is the shape of the seam, not the package.
+
+## Transport seams
+
+Two seams reach stacks no adapter does, by sitting on the wire rather than in
+the process.
+
+### Enforcing HTTP gateway
+
+`continuum gateway` is a local proxy the application points at instead of the
+real upstream, so an outbound call from any language needs a claim first:
+
+```bash
+continuum gateway --port 8765     # routes read from .continuum/gateway.json
+```
+
+Routes are data, not code, and `--config` names another file:
+
+```json
+{
+  "upstreams": [
+    {"host": "api.example.com", "methods": ["POST"],
+     "prefix": "/v1/invoices", "action_type": "send_invoice",
+     "key_template": "invoice:{id}"}
+  ]
+}
+```
+
+Decision semantics mirror `gate`: a matching request proceeds only when a live
+STARTED claim exists for its derived key, a duplicate is refused because the
+effect already happened, and an uncertain outcome demands reconciliation first.
+After forwarding, the gateway settles the claim from the real status code,
+COMPLETED on 2xx/3xx, FAILED-certain on 4xx because the upstream definitively
+rejected it, FAILED-uncertain on 5xx and timeouts because the effect may still
+have landed, and records `TOOL_COMPLETED` evidence with the status.
+
+Unknown hosts are refused rather than forwarded, because a proxy that forwards
+anywhere would be an open relay wearing CONTINUUM's name, and the gateway
+refuses to start at all when the registry holds no upstream. `key_template`
+substitutes top-level JSON body fields only, exactly as `gate` does. Tests:
+`tests/test_gateway.py`.
+
+### OpenTelemetry bridge
+
+`continuum.otel.make_span_processor(storage)` turns telemetry a traced app
+already emits into evidence, with no change to the application:
+
+```python
+provider.add_span_processor(continuum.otel.make_span_processor(storage))
+```
+
+A span counts as a tool call when any of `gen_ai.tool.name`, `tool.name`,
+`openinference.tool.name`, `mcp.tool.name` or `function.name` names one, first
+match wins. Qualifying spans land in the active run (or an explicit `run_id`) as
+`TOOL_COMPLETED`, or `TOOL_FAILED` when the span status is not ok, carrying the
+same payload shape `continuum observe` writes plus `via="otel"`.
+
+Recognition is heuristic by design, because production pipelines use several
+attribute conventions. Non-tool spans are ignored, and a span that arrives with
+no active run is dropped rather than raising, matching how `observe` treats
+telemetry from outside a run. Size and digest are never invented, because a span
+does not carry the file's bytes. Install with
+`pip install "continuum-agent[otel]"`; `make_span_processor` raises
+`RuntimeError` with an install hint when OpenTelemetry is not importable, and the
+pure core (`observation_from_span`, `record_span`) needs no SDK at all. Tests:
+`tests/test_otel.py`.
+
 ## Exactly-once side effects and recovery
 
 - External side effects are claimed in the action ledger before execution and
