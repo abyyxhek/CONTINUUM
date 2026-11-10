@@ -10,7 +10,10 @@ import pytest
 from continuum.events import EventType
 from continuum.models import Origin, Run
 from continuum.recovery.risk import (
+    RiskPolicy,
+    RiskPolicyError,
     evaluate_risk,
+    evaluate_risk_action,
     ingest_risk,
     ingest_risk_json_line,
     is_more_conservative,
@@ -355,3 +358,77 @@ def test_engine_falls_back_to_defaults_on_an_invalid_policy(
     # fallback is visible as a counter rather than silent.
     assert decision.mode.value == "abort"
     assert get_metrics().snapshot()["counters"].get(RISK_POLICY_LOAD_FALLBACK) == 1
+
+
+def test_policy_accessors_expose_the_threshold_an_embedder_sets() -> None:
+    # to_dict() and json_schema() are the public surface an embedding caller
+    # uses; nothing in src/ calls either, so a dropped key would go unnoticed.
+    from continuum.recovery.risk_policy import DEFAULT_RISK_POLICY, RISK_POLICY_SCHEMA
+
+    policy = RiskPolicy({"meltdown": "abort"}, token_runaway_threshold=0.5)
+    payload = policy.to_dict()
+    assert payload["meltdown"] == "abort", "the more conservative override survives"
+    assert payload["token_runaway_threshold"] == 0.5, "the threshold rides along"
+    for trigger, mode in DEFAULT_RISK_POLICY.items():
+        if trigger == "meltdown":
+            continue  # this one carries the override asserted above
+        assert payload[trigger] == mode, "baseline triggers stay populated"
+    assert RiskPolicy.json_schema() == RISK_POLICY_SCHEMA
+
+
+def test_load_risk_policy_fails_closed_on_an_unreadable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The JSONDecodeError arm is already pinned; a file that exists but cannot
+    # be read must fail the same way rather than be treated as absent.
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"loop": "replan"}), encoding="utf-8")
+
+    def _deny(self: Path, *args: object, **kwargs: object) -> str:
+        if self == policy_file:
+            raise OSError("permission denied")
+        raise AssertionError("only the policy file read should fail")
+
+    monkeypatch.setattr(Path, "read_text", _deny)
+    with pytest.raises(RiskPolicyError, match="invalid risk policy"):
+        load_risk_policy(policy_file)
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_load_risk_policy_rejects_blank_keys_before_unknown_ones(
+    tmp_path: Path, blank: str
+) -> None:
+    # The empty-key guard runs before the unknown-trigger check, so a blank
+    # key fails closed with its own message rather than the trigger one.
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({blank: "wait"}), encoding="utf-8")
+    with pytest.raises(RiskPolicyError, match="non-empty strings"):
+        load_risk_policy(policy_file)
+
+
+def test_is_more_conservative_orders_known_modes_and_refuses_the_unknown() -> None:
+    # The ordering the safety argument leans on, plus the fallback that decides
+    # any mode outside _SEVERITY_ORDER is not an upgrade: dropping that arm
+    # would let an operator downgrade below baseline unnoticed.
+    assert is_more_conservative("abort", "rollback") is True
+    assert is_more_conservative("resume", "wait") is False
+    assert is_more_conservative("annotate", "abort") is False
+    assert is_more_conservative("nonsense", "wait") is False
+    assert is_more_conservative("wait", "nonsense") is False
+
+
+def test_evaluate_risk_action_threshold_and_mode_fallbacks() -> None:
+    # A non-numeric threshold on a plain mapping falls back to the 0.8
+    # baseline; a lowered RiskPolicy threshold escalates at that threshold;
+    # and a mode string the enum does not know declines instead of raising.
+    from continuum.models import RecoveryMode
+
+    plain = {"token_runaway": "wait", "token_runaway_threshold": "not-a-number"}
+    assert evaluate_risk_action("token_runaway", score=0.9, policy=plain) is RecoveryMode.ABORT
+    assert evaluate_risk_action("token_runaway", score=0.5, policy=plain) is RecoveryMode.WAIT
+
+    low = RiskPolicy({"token_runaway": "wait"}, token_runaway_threshold=0.5)
+    assert evaluate_risk_action("token_runaway", score=0.6, policy=low) is RecoveryMode.ABORT
+    assert evaluate_risk_action("token_runaway", score=0.4, policy=low) is RecoveryMode.WAIT
+
+    assert evaluate_risk_action("loop", policy={"loop": "not-a-mode"}) is None
