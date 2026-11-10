@@ -377,6 +377,38 @@ def test_instruction_target_drift_shows_in_the_doctor(
     assert row.remedy is not None
 
 
+def test_drifted_instruction_target_renders_its_detail_and_remedy(
+    env: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """A drifted target drives the 'not healthy' verdict, so it must say what to run.
+
+    The instructions surface reports its own fault word ('drifted') instead of
+    the generic stale vocabulary, so the renderer's fault gate has to read the
+    row's flags: a row the verdict counts must print both its detail and its
+    fix, or the operator is sent looking for a line that is not there.
+    """
+
+    from continuum.agents import generator
+
+    root, _ = env
+    generator.install("claude", root=root)
+    (root / "CLAUDE.md").write_text(
+        (root / "CLAUDE.md").read_text(encoding="utf-8") + "\nhand edit\n", encoding="utf-8"
+    )
+
+    report = scan(env)
+    row = ide_for(report, "claude", "instructions")
+    assert row.state == "drifted"
+    assert report.stale, "drift counts as stale, which is what makes the report unhealthy"
+
+    text = diagnose.render_report(report)
+    assert "-> fix: run `continuum agents install --target claude`" in text
+    assert any(
+        line.lstrip().startswith("->") and "edited by hand" in line
+        for line in text.splitlines()
+    ), "the drifted row must print what drifted, not only that it did"
+
+
 def test_json_form_matches_the_human_form(env: tuple[Path, Path]) -> None:
     """--json is a documented contract, so both forms must agree state for state."""
 

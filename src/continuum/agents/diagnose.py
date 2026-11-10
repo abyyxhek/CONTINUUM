@@ -660,9 +660,18 @@ def render_report(report: DoctorReport) -> str:
     lines = ["CONTINUUM doctor: is CONTINUUM actually wired up here?", ""]
     for ide in report.ides:
         lines.append(f"{ide.ide:<{_WIDTH}} {ide.surface:<13} {ide.state:<20} {ide.summary}")
-        if ide.unresolved or ide.state in (STALE, DEGRADED, f"{STALE}+{DEGRADED}", UNRESOLVED):
+        # A row prints its cause and remedy whenever the verdict counts it as
+        # a fault. The hook rows spell that with the generic stale/degraded
+        # words, and the instructions surface with its own ('drifted'), so the
+        # gate is the row's own flags rather than any one vocabulary: every row
+        # that drives the 'not healthy' verdict must show what to do about it.
+        if ide.unresolved or ide.stale or ide.degraded:
             for detail in ide.details:
-                if "read-only" in detail or "bakes" in detail:
+                if (
+                    "read-only" in detail
+                    or "bakes" in detail
+                    or ide.state_override is not None
+                ):
                     lines.append(f"{'':<{_WIDTH}} -> {detail}")
             if ide.remedy:
                 lines.append(f"{'':<{_WIDTH}} -> fix: {ide.remedy}")
