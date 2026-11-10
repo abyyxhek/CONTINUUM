@@ -221,3 +221,137 @@ def test_clean_run_output_has_no_section(tmp_path: Path) -> None:
 def test_resume_prints_next_steps_exactly_once(history_db: str) -> None:
     _, out, _ = run("--db", history_db, "resume", "run_1")
     assert out.count("\n\nNext steps:\n") == 1
+
+
+# --- step names, avoid-rule components, and the deep eviction arms (#2054) ----- #
+
+
+def build_block(
+    storage: SQLiteStorage,
+    run_id: str = "run_1",
+    *,
+    plan: list[dict] | None = None,
+    statuses: list[object] | None = None,
+) -> dict:
+    """A block from a seeded store, with the qualifying signal of the caller's choice."""
+
+    from continuum.models import StateValidationResult
+
+    if plan is not None:
+        storage.append_event("run_1", EventType.RECOVERY_STARTED, {"plan": plan})
+    report = StateValidationResult(run_id=run_id, statuses=statuses or [])  # type: ignore[arg-type]
+    block = build_informed_retry(storage, run_id, validation_report=report)
+    assert block is not None, "the block must qualify on the signal under test"
+    return block
+
+
+def test_step_names_resolve_from_every_plan_shape_the_store_carries() -> None:
+    """Stored plans spell a step three ways; each must render as the plan reads it."""
+
+    storage = make_storage()
+    block = build_block(
+        storage,
+        plan=[
+            {"action_name": "send_invoice"},
+            {"kind": "fetch", "target": "db"},
+            {"kind": "plan"},
+            {"target": "target-only"},  # no kind: resolves to empty and is dropped
+        ],
+    )
+    assert block["last_attempt_steps"] == ["send_invoice", "fetch:db", "plan"]
+
+
+def test_avoid_rules_name_every_component_kind() -> None:
+    """Each component family gets the one-line directive an operator can act on."""
+
+    from continuum.models import Component, ComponentValidationEntry, StateStatus
+
+    statuses = [
+        ComponentValidationEntry(
+            component=Component.EVIDENCE, component_id="doc1", status=StateStatus.STALE
+        ),
+        ComponentValidationEntry(
+            component=Component.FINDING, component_id="f1", status=StateStatus.STALE
+        ),
+        ComponentValidationEntry(
+            component=Component.MODEL, component_id="m1", status=StateStatus.STALE
+        ),
+        ComponentValidationEntry(
+            component=Component.APPROVAL, component_id="a1", status=StateStatus.STALE
+        ),
+    ]
+    block = build_block(make_storage(), statuses=statuses)
+    assert (
+        "evidence:doc1: stale; re-derive from its source before citing it again" in block["avoid"]
+    )
+    assert "finding:f1: stale; re-derive from its source before citing it again" in block["avoid"]
+    assert "model:m1: model assumptions unverified; confirm which model resumes" in block["avoid"]
+    assert "approval:a1: approval does not carry over; obtain a fresh one" in block["avoid"]
+
+
+def test_fit_strips_detail_then_breaks_rather_than_spinning() -> None:
+    """The last eviction resort empties detail and then stops, corrupting nothing.
+
+    A single untrimmable failure whose id alone exceeds the cap can never fit,
+    so the loop must strip what it can and break, returning the entry intact
+    rather than looping forever or mangling the dictionary.
+    """
+
+    fat = {
+        "attempts": 1,
+        "completed_recoveries": 0,
+        "blocked_recoveries": 0,
+        "compensations": 0,
+        "last_attempt_mode": None,
+        "last_attempt_steps": ["only"],
+        "settled_effects": [],
+        "current_failures": [
+            {"component": "evidence", "id": "i" * 5000, "status": "stale", "detail": "d" * 500}
+        ],
+        "avoid": [],
+    }
+    fitted = _fit(fat)
+    entry = fitted["current_failures"]
+    assert len(entry) == 1, "the untrimmable entry survives whole"
+    assert entry[0]["detail"] == "", "detail is stripped before the loop gives up"
+    assert entry[0]["id"] == "i" * 5000, "nothing else of the entry is touched"
+    # The block still cannot fit, which is the documented hard-stop outcome.
+    assert len(json.dumps(fitted, sort_keys=True).encode()) > INFORMED_RETRY_CAP_BYTES
+
+
+def test_render_names_counts_and_failures_without_an_id() -> None:
+    """The rendered lines carry the counts, the settlements, and the bare components."""
+
+    block: dict = {
+        "attempts": 2,
+        "completed_recoveries": 3,
+        "blocked_recoveries": 1,
+        "compensations": 2,
+        "last_attempt_mode": "replan",
+        "last_attempt_steps": [],
+        "settled_effects": [
+            {"action_type": "send_invoice", "occurred": True},
+            {"action_type": "charge_card", "occurred": False},
+        ],
+        "current_failures": [
+            {"component": "evidence", "id": "doc1", "status": "stale", "detail": "edited by hand"},
+            {"component": "goal", "id": "", "status": "stale", "detail": ""},
+        ],
+        "avoid": ["evidence:doc1: stale; re-derive from its source before citing it again"],
+    }
+    lines = render_informed_retry(block)
+    assert "previous attempt(s): 2" in lines
+    assert "  last plan mode: replan" in lines
+    assert "recoveries completed: 3" in lines
+    assert "recoveries blocked: 1" in lines
+    assert "compensations applied: 2" in lines
+    assert "settled send_invoice: effect confirmed present" in lines
+    assert "settled charge_card: absence confirmed" in lines
+    assert "still failing: evidence:doc1 (edited by hand)" in lines
+    # A failure with no id renders the bare component, with no dangling colon.
+    assert "still failing: goal" in lines
+    assert not any(line.startswith("still failing: goal:") for line in lines), lines
+    assert (
+        "avoid repeating: evidence:doc1: stale; re-derive from its source before citing it again"
+        in lines
+    )
