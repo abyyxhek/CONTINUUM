@@ -81,18 +81,26 @@ def _validate_spiffe_id(spiffe_id: str) -> None:
         )
     parts = spiffe_id[len("spiffe://") :].split("/", 1)
     path = parts[1] if len(parts) > 1 else ""
-    for segment in path.split("/"):
-        if not segment:
-            raise ValueError(f"malformed SPIFFE ID: empty path segment in {spiffe_id!r}")
-        if segment in (".", ".."):
-            raise ValueError(
-                f"malformed SPIFFE ID: path segments '.' and '..' are not allowed in {spiffe_id!r}"
-            )
-        if not _PATH_SEGMENT_RE.match(segment):
-            raise ValueError(
-                f"malformed SPIFFE ID: invalid character in path segment {segment!r} "
-                f"of {spiffe_id!r}"
-            )
+    # The path component is optional, and the SPIFFE-ID spec (section 3.1)
+    # recommends a trust domain's own signing authority carry no path at all.
+    # An empty path ('spiffe://example.org', or the trailing-slash form of the
+    # same identity) therefore validates against the trust domain alone; the
+    # segment walk only runs when a path is present, so a lone '/' is not read
+    # as an empty segment.
+    if path:
+        for segment in path.split("/"):
+            if not segment:
+                raise ValueError(f"malformed SPIFFE ID: empty path segment in {spiffe_id!r}")
+            if segment in (".", ".."):
+                raise ValueError(
+                    f"malformed SPIFFE ID: path segments '.' and '..' are not allowed "
+                    f"in {spiffe_id!r}"
+                )
+            if not _PATH_SEGMENT_RE.match(segment):
+                raise ValueError(
+                    f"malformed SPIFFE ID: invalid character in path segment {segment!r} "
+                    f"of {spiffe_id!r}"
+                )
 
 
 @dataclass(frozen=True, slots=True)

@@ -161,6 +161,51 @@ def test_spiffe_provider_reports_missing_spiffe_package(monkeypatch: pytest.Monk
         provider.get_identity()
 
 
+def test_workload_identity_accepts_path_less_spiffe_ids() -> None:
+    """A trust domain's own signing authority carries no path (SPIFFE-ID spec 3.1).
+
+    The path component is optional, so 'spiffe://example.org' and its
+    trailing-slash twin must validate as identities of their trust domain
+    alone, and must round-trip through the attestation binding path.
+    """
+    canonical = WorkloadIdentity("spiffe://example.org")
+    assert canonical.spiffe_id == "spiffe://example.org"
+    assert canonical.trust_domain == "example.org"
+
+    # The trailing-slash form is the same path-less identity, not an empty
+    # path segment.
+    slash = WorkloadIdentity("spiffe://example.org/")
+    assert slash.trust_domain == "example.org"
+
+    for ident in (canonical, slash):
+        restored = WorkloadIdentity.from_dict(ident.to_dict())
+        assert restored.spiffe_id == ident.spiffe_id
+        assert restored.trust_domain == "example.org"
+
+    # A path-less identity can also be the expected binding of a verified
+    # chain, which exercises the same construction through from_dict.
+    priv_pem, _ = generate_keypair()
+    attest = sign_chain(
+        priv_pem,
+        run_id="run_spiffe_pathless",
+        trusted_through_seq=10,
+        chain_hash="hash_root_123",
+        signer="prod-orchestrator",
+        workload_identity=canonical,
+    )
+    assert attest.workload_identity is not None
+    assert attest.workload_identity["spiffe_id"] == "spiffe://example.org"
+    doc = attest.to_dict()
+    assert (
+        verify_attestation(
+            doc,
+            expected_chain_hash="hash_root_123",
+            expected_workload_identity="spiffe://example.org",
+        )
+        is True
+    )
+
+
 def test_workload_identity_rejects_malformed_spiffe_ids() -> None:
     """Validation mirrors what real SPIFFE implementations accept."""
     for bad in (
