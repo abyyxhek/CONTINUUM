@@ -667,11 +667,7 @@ def render_report(report: DoctorReport) -> str:
         # that drives the 'not healthy' verdict must show what to do about it.
         if ide.unresolved or ide.stale or ide.degraded:
             for detail in ide.details:
-                if (
-                    "read-only" in detail
-                    or "bakes" in detail
-                    or ide.state_override is not None
-                ):
+                if "read-only" in detail or "bakes" in detail or ide.state_override is not None:
                     lines.append(f"{'':<{_WIDTH}} -> {detail}")
             if ide.remedy:
                 lines.append(f"{'':<{_WIDTH}} -> fix: {ide.remedy}")

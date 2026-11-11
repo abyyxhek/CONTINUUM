@@ -404,8 +404,7 @@ def test_drifted_instruction_target_renders_its_detail_and_remedy(
     text = diagnose.render_report(report)
     assert "-> fix: run `continuum agents install --target claude`" in text
     assert any(
-        line.lstrip().startswith("->") and "edited by hand" in line
-        for line in text.splitlines()
+        line.lstrip().startswith("->") and "edited by hand" in line for line in text.splitlines()
     ), "the drifted row must print what drifted, not only that it did"
 
 
