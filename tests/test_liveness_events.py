@@ -125,6 +125,22 @@ def test_breach_rationale_states_the_reason_once(tmp_path: Path) -> None:
         assert decision.contract.reason.count("liveness breach:") == 1
 
 
+def test_watch_renders_event_less_run_silence_as_text(tmp_path: Path) -> None:
+    # Regression for #2080: a run whose log has no events has silence_seconds
+    # None (documented as absent until the first event), and the non-breach
+    # arm printed the machine "None" instead of operator text like the
+    # breached arm renders.
+    db = str(tmp_path / "watch_silence_none.db")
+    with SQLiteStorage(db) as store:
+        store.create_run(Run(run_id="run_no_events", goal="no events yet"))
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(["--db", db, "watch", "run_no_events"], out=out, err=err)
+    assert code == 0
+    assert "None" not in out.getvalue()
+    assert "no events yet, no silence to evaluate" in out.getvalue()
+
+
 def test_watch_appends_detected_and_recovered(tmp_path: Path) -> None:
     db = str(tmp_path / "watch_events.db")
     with SQLiteStorage(db) as store:

@@ -1254,11 +1254,16 @@ def cmd_watch(args: argparse.Namespace, storage: Storage, out: Any, err: Any) ->
         "breached": breached,
         "liveness": advisory,
     }
-    text = (
-        _liveness_text(advisory)
-        if breached
-        else f"Liveness ok for {run_id}: {advisory.get('silence_seconds')}"
-    )
+    if breached:
+        text = _liveness_text(advisory)
+    else:
+        # health.py documents silence_seconds as absent until the first
+        # event, so render operator text rather than the machine "None".
+        silence = advisory.get("silence_seconds")
+        if silence is None:
+            text = f"Liveness ok for {run_id}: no events yet, no silence to evaluate"
+        else:
+            text = f"Liveness ok for {run_id}: {silence}"
     if breached and on_breach == "webhook" and webhook_url:
         from continuum.recovery.notify import post_webhook
 
