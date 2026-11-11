@@ -13,7 +13,9 @@ import json
 import sqlite3
 import threading
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +25,7 @@ from continuum.cli import ExitCode
 from continuum.events import EventType
 from continuum.models import Action, ActionStatus, Run, UnknownSideEffect
 from continuum.storage import SQLiteStorage
+from continuum.storage.actionindex import index_entry_from_payload, index_order_for
 from continuum.storage.migrations import SCHEMA_VERSION
 from continuum.storage.postgres import PostgresStorage
 
@@ -583,3 +586,105 @@ def test_postgres_rebuild_action_index_reports_corrected_count() -> None:
         {"key": "k2", "updated_seq": 2, "status": "started"},
     ]
     assert store.rebuild_action_index() == 0
+
+
+# --- serialisation and normalisation guards (issue #2045) ----------------------- #
+
+
+def test_index_order_for_aligns_a_naive_datetime_to_utc() -> None:
+    """A timestamp without tzinfo is read as UTC, not as local time, so the
+    stored epoch microseconds cannot shift with the host's timezone."""
+    naive = datetime(2026, 1, 1, 12, 0, 0)
+    assert index_order_for(naive) == index_order_for(naive.replace(tzinfo=UTC))
+
+
+def test_index_order_for_takes_an_iso_string_and_a_datetime_equivalently() -> None:
+    when = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+    assert index_order_for(when.isoformat()) == index_order_for(when)
+    assert index_order_for(when) == int(when.timestamp() * 1_000_000)
+
+
+def test_index_entry_from_payload_returns_none_for_non_action_events() -> None:
+    """The index tracks ledger writes only; anything else is not a row."""
+    payload = {"key": "k", "action": {"action_id": "a1"}}
+    assert index_entry_from_payload(EventType.RUN_STARTED, payload) is None
+    assert index_entry_from_payload(EventType.STATE_CHECKPOINTED, payload) is None
+
+
+def test_index_entry_from_payload_rejects_malformed_keys_and_actions() -> None:
+    """A malformed payload yields None rather than a half-row, because the
+    index must never disagree with the log silently."""
+    action = {"run_id": "r1", "action_id": "a1", "status": "started"}
+    for key in (None, 123, ""):
+        assert (
+            index_entry_from_payload(EventType.ACTION_RECORDED, {"key": key, "action": action})
+            is None
+        )
+    for bad_action in ("string", None, [], 42):
+        assert (
+            index_entry_from_payload(EventType.ACTION_RECORDED, {"key": "k", "action": bad_action})
+            is None
+        )
+    # A payload missing either field entirely is just as malformed.
+    assert index_entry_from_payload(EventType.ACTION_RECORDED, {}) is None
+
+
+def test_index_entry_from_payload_extracts_the_row_fields_in_order() -> None:
+    action = {
+        "run_id": "run_1",
+        "action_id": "a1",
+        "status": "started",
+        "action_type": "send_invoice",
+    }
+    row = index_entry_from_payload(EventType.ACTION_RECORDED, {"key": "k", "action": action})
+    assert row is not None
+    key, run_id, action_id, status, action_json, rendered_key = row
+    assert (key, run_id, action_id, status) == ("k", "run_1", "a1", "started")
+    assert json.loads(action_json) == action
+    assert rendered_key is None
+
+
+def test_index_entry_from_payload_defaults_missing_row_fields_to_empty_strings() -> None:
+    """The embedded record is the authority for identity, but a payload that
+    omits a field still produces a row rather than raising."""
+    row = index_entry_from_payload(EventType.ACTION_RECORDED, {"key": "k", "action": {}})
+    assert row is not None
+    assert row[1:4] == ("", "", "")
+
+
+def test_index_entry_from_payload_drops_a_rendered_key_that_is_not_a_memory_key() -> None:
+    """``rendered_key`` is the plaintext identity the key was hashed from and
+    only memory writes carry one, so an ordinary action key must not leak in."""
+    action = {"run_id": "r1", "action_id": "a1", "status": "started"}
+    row = index_entry_from_payload(
+        EventType.ACTION_RECORDED, {"key": "k", "action": action, "rendered_key": "invoice:1"}
+    )
+    assert row is not None
+    assert row[5] is None
+
+
+def test_index_entry_from_payload_keeps_a_memory_rendered_key() -> None:
+    action = {"run_id": "r1", "action_id": "a1", "status": "started"}
+    rendered = "mem:store:tenant:invoice:1"
+    row = index_entry_from_payload(
+        EventType.ACTION_RECORDED, {"key": "k", "action": action, "rendered_key": rendered}
+    )
+    assert row is not None
+    assert row[5] == rendered
+
+
+def test_index_entry_from_payload_returns_none_when_the_action_cannot_be_serialised() -> None:
+    """An unserialisable embedded record aborts the whole row, not just the
+    JSON column: a TypeError (non-serialisable object) or a ValueError
+    (circular reference) both degrade to None instead of escaping."""
+    row = index_entry_from_payload(
+        EventType.ACTION_RECORDED, {"key": "k", "action": {"obj": object()}}
+    )
+    assert row is None
+
+    circular: list[Any] = []
+    circular.append(circular)
+    row = index_entry_from_payload(
+        EventType.ACTION_RECORDED, {"key": "k", "action": {"chain": circular}}
+    )
+    assert row is None
