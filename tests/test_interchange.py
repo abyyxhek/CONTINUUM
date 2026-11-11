@@ -145,6 +145,9 @@ def _decision() -> RecoveryDecision:
         restored=restored,
         uncertain_actions=(action,),
         rationale=("Goal verified", "Progress intact", "Environment stable"),
+        impacted_files=frozenset({"src/billing.py", "docs/billing.md"}),
+        tail_evidence="last checkpoint replayed intact",
+        informed_retry={"focus": "retry idempotently", "steps": ["verify", "retry"]},
     )
 
 
@@ -171,6 +174,29 @@ def test_recovery_decision_round_trips():
     assert restored.mode is RecoveryMode.RESUME
     assert restored.permits("anything") is True
     assert restored.contract.next_allowed_action is None
+
+
+def test_recovery_decision_round_trips_engine_only_fields():
+    # assess() populates the last three fields (engine.py), so the envelope must
+    # carry them: an empty impact set, a missing summary and a dropped
+    # informed-retry block would otherwise come back at their defaults.
+    decision = _decision()
+    restored = import_recovery_decision(export_recovery_decision(decision))
+    assert restored.impacted_files == frozenset({"src/billing.py", "docs/billing.md"})
+    assert restored.tail_evidence == "last checkpoint replayed intact"
+    assert restored.informed_retry == {
+        "focus": "retry idempotently",
+        "steps": ["verify", "retry"],
+    }
+
+
+def test_recovery_decision_impacted_files_serialize_sorted():
+    # A frozenset has no wire order; the document pins a sorted list so the
+    # payload is deterministic, and re-imports as the same frozenset.
+    decision = _decision()
+    payload = export_recovery_decision(decision)
+    assert payload["data"]["impacted_files"] == ["docs/billing.md", "src/billing.py"]
+    assert import_recovery_decision(payload).impacted_files == decision.impacted_files
 
 
 def test_envelope_is_versioned_and_kind_tagged():
@@ -245,6 +271,17 @@ def test_published_schema_matches_round_tripped_payload():
     decision = _decision()
     payload = export_recovery_decision(decision)
     assert import_recovery_decision(payload) == decision
+
+
+def test_published_schema_covers_the_engine_only_fields():
+    # The document model generates the published schema, so the three fields
+    # assess() fills must be part of it rather than unknown to an external
+    # verifier (they used to be stripped before the round trip).
+    schema = published_schema("recovery_decision")
+    properties = schema["properties"]
+    assert "impacted_files" in properties
+    assert "tail_evidence" in properties
+    assert "informed_retry" in properties
 
 
 # --------------------------------------------------------------------------- #

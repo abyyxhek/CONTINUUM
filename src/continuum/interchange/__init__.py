@@ -183,6 +183,14 @@ class RecoveryDecisionDocument(BaseModel):
     restored: RestoredRunDocument
     uncertain_actions: list[Action] = Field(default_factory=list)
     rationale: list[str] = Field(default_factory=list)
+    #: The files the engine's assessment touched or produced. A frozenset on the
+    #: decision; the wire form is a sorted list so the payload is deterministic.
+    impacted_files: list[str] = Field(default_factory=list)
+    #: Summary of the tail of the log the decision was based on (#265).
+    tail_evidence: str | None = None
+    #: Informed-retry block (#265): a pure projection of prior recovery-path
+    #: events plus current failure signals, or None when there is no history.
+    informed_retry: dict[str, Any] | None = None
 
 
 def _decision_to_document(decision: RecoveryDecision) -> RecoveryDecisionDocument:
@@ -205,6 +213,9 @@ def _decision_to_document(decision: RecoveryDecision) -> RecoveryDecisionDocumen
         ),
         uncertain_actions=list(decision.uncertain_actions),
         rationale=list(decision.rationale),
+        impacted_files=sorted(decision.impacted_files),
+        tail_evidence=decision.tail_evidence,
+        informed_retry=decision.informed_retry,
     )
 
 
@@ -232,6 +243,9 @@ def _document_to_decision(document: RecoveryDecisionDocument) -> RecoveryDecisio
         restored=restored,
         uncertain_actions=tuple(document.uncertain_actions),
         rationale=tuple(document.rationale),
+        impacted_files=frozenset(document.impacted_files),
+        tail_evidence=document.tail_evidence,
+        informed_retry=document.informed_retry,
     )
 
 

@@ -14,6 +14,17 @@
         "progress"
       ]
     },
+    "impacted_files": [
+      "docs/billing.md",
+      "src/billing.py"
+    ],
+    "informed_retry": {
+      "focus": "retry idempotently",
+      "steps": [
+        "verify",
+        "retry"
+      ]
+    },
     "mode": "resume",
     "plan": {
       "steps": [
@@ -160,6 +171,7 @@
       }
     },
     "run_id": "run_demo",
+    "tail_evidence": "last checkpoint replayed intact",
     "uncertain_actions": [
       {
         "action_id": "action_b61f01700091b2e1e103b5b89e58ad96",
