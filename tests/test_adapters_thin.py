@@ -18,7 +18,10 @@ import pytest
 
 from continuum.adapters.thin import (
     ContinuumToolGuard,
+    autogen_available,
+    crewai_available,
     install_crewai_hooks,
+    pydantic_ai_available,
     wrap_autogen_tool,
     wrap_pydantic_ai_hooks,
 )
@@ -298,3 +301,147 @@ def test_guard_source_override_is_respected(db: str) -> None:
         ]
     assert action_events
     assert {e.source for e in action_events} == {Origin.DETERMINISTIC}
+
+
+# --- availability probes, argument shapes and token guards (#2051) ------------- #
+
+
+def test_the_probes_report_a_present_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All three probes answer through one ``_flag`` helper without importing
+    the framework they are asked about."""
+    monkeypatch.setattr("continuum.adapters.thin._flag", lambda module: True)
+    assert crewai_available() is True
+    assert pydantic_ai_available() is True
+    assert autogen_available() is True
+
+
+def test_the_probes_report_an_absent_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing optional dependency is a plain False, never a raise."""
+    monkeypatch.setattr("continuum.adapters.thin._flag", lambda module: False)
+    assert crewai_available() is False
+    assert pydantic_ai_available() is False
+    assert autogen_available() is False
+
+
+def test_flag_asks_importlib_without_importing_the_module() -> None:
+    """The probe itself is importlib.util.find_spec: False for a package that
+    is not installed, True for one find_spec resolves."""
+    from continuum.adapters.thin import _flag
+
+    assert _flag("definitely_not_a_real_module_xyz") is False
+
+    import importlib.util
+
+    called: list[str] = []
+    real_find_spec = importlib.util.find_spec
+
+    def spy(name: str, *rest: Any, **kwargs: Any) -> Any:
+        called.append(name)
+        spec = real_find_spec(name, *rest, **kwargs)
+        return spec if spec is not None else object()
+
+    importlib.util.find_spec = spy  # type: ignore[method-assign]
+    try:
+        assert _flag("json") is True
+    finally:
+        importlib.util.find_spec = real_find_spec  # type: ignore[method-assign]
+    assert called == ["json"]
+
+
+def test_autogen_probe_raises_for_a_missing_parent_package() -> None:
+    """Documented behaviour, worth pinning: the AutoGen probe resolves a
+    dotted name, so a missing parent imports-and-raises instead of answering
+    False. A caller probing on a bare machine must catch it."""
+    from continuum.adapters.thin import autogen_available
+
+    with pytest.raises(ModuleNotFoundError):
+        autogen_available()
+
+
+def test_args_dict_normalises_every_framework_argument_shape(db: str) -> None:
+    """A pydantic model is dumped, a bare string becomes an input, and
+    anything else is carried under value, so the derived key is stable across
+    framework argument shapes."""
+    with SQLiteStorage(db) as store:
+        guard = ContinuumToolGuard(store, "run_1")
+
+        class Payload:
+            def model_dump(self) -> dict[str, Any]:
+                return {"id": "P-9"}
+
+        assert guard._args_dict(Payload()) == {"id": "P-9"}
+        assert guard._args_dict("search query") == {"input": "search query"}
+        assert guard._args_dict(42) == {"value": 42}
+        assert guard._args_dict({"id": "dict"}) == {"id": "dict"}
+
+
+def test_completing_an_unknown_token_is_a_no_op(db: str) -> None:
+    """A framework that fires its after-hook twice, or for a call never
+    claimed, cannot double-settle: unknown tokens are ignored and the ledger
+    is untouched."""
+    with SQLiteStorage(db) as store:
+        guard = ContinuumToolGuard(store, "run_1")
+        guard.complete(99999, result="never claimed")
+        guard.fail(99999, "never claimed")
+    assert statuses(db) == []
+
+
+def test_failing_an_unknown_token_is_a_no_op(db: str) -> None:
+    with SQLiteStorage(db) as store:
+        guard = ContinuumToolGuard(store, "run_1")
+        guard.fail(99999, "never claimed")
+    assert statuses(db) == []
+
+
+def test_crewai_after_hook_settles_as_failed_on_an_error(db: str) -> None:
+    """The error arm of the crewai after-hook: a context carrying an error
+    fails the claim rather than completing it."""
+    fake = FakeCrewAIHooks()
+    crewai_pkg = types.ModuleType("crewai")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setitem(sys.modules, "crewai", crewai_pkg)
+    monkeypatch.setitem(sys.modules, "crewai.hooks", fake)
+    monkeypatch.setattr("continuum.adapters.thin.crewai_available", lambda: True)
+    try:
+        install_crewai_hooks(SQLiteStorage(db), "run_1")
+        ctx = Context("send_invoice", {"id": "X"})
+        assert fake.before[0](ctx) is None  # allowed
+        ctx.error = "tool crashed"
+        assert fake.after[0](ctx) is None
+    finally:
+        monkeypatch.undo()
+    assert last_action(db).status is ActionStatus.FAILED
+
+
+def test_crewai_uninstall_falls_back_to_clearing_every_hook(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older crewai registry exposes no per-hook unregister: the installer
+    falls back to clearing every tool-call hook rather than dying."""
+    fake = FakeCrewAIHooks()
+    del fake.unregister_before_tool_call_hook
+    del fake.unregister_after_tool_call_hook
+    fake.clear_all_tool_call_hooks = lambda: fake.before.clear() or fake.after.clear()
+    monkeypatch.setitem(sys.modules, "crewai", types.ModuleType("crewai"))
+    monkeypatch.setitem(sys.modules, "crewai.hooks", fake)
+    monkeypatch.setattr("continuum.adapters.thin.crewai_available", lambda: True)
+
+    uninstall = install_crewai_hooks(SQLiteStorage(db), "run_1")
+    uninstall()
+    assert fake.before == [] and fake.after == []
+
+
+@pytest.mark.asyncio
+async def test_pydantic_after_hook_without_a_matching_before_returns_the_result(
+    db: str,
+) -> None:
+    """A context with no stashed token is ignored, and the framework's own
+    result still stands, so a duplicate or stray after-hook changes nothing."""
+    hooks = wrap_pydantic_ai_hooks(SQLiteStorage(db), "run_1")
+
+    class Ctx:
+        pass
+
+    result = await hooks.after_tool_call(Ctx(), "charge_card", {}, result="charged")
+    assert result == "charged"
+    assert statuses(db) == []
