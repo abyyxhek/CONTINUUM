@@ -22,6 +22,7 @@ import pytest
 from continuum.cli import ExitCode, main
 from continuum.events import EventType
 from continuum.models import (
+    AttemptLesson,
     Component,
     ComponentValidationEntry,
     Evidence,
@@ -35,6 +36,7 @@ from continuum.models import (
     SemanticState,
     StateStatus,
     StateValidationResult,
+    TrajectoryReport,
 )
 from continuum.recovery.briefing_curation import (
     _MAX_QUARANTINE_ITEMS,
@@ -536,3 +538,163 @@ def test_render_empty_curation_produces_no_lines() -> None:
     """Nothing to say renders as nothing, not an empty header."""
     curated: dict[str, Any] = {"sections": [], "quarantine": [], "omitted": []}
     assert render_curated_briefing(curated) == []
+
+
+# --- system-derived sections and contract reason (issues #2047, #2052) ---------- #
+#
+# The three system-derived sections (attempt lessons, trajectory reports,
+# informed retry) and the sealed contract's optional ``why:`` line are pure
+# functions of the decision, so they are driven directly with the stub storage
+# rather than through a run.
+
+
+def _state_with(
+    attempt_lessons: list[Any] | None = None,
+    trajectory_reports: list[Any] | None = None,
+) -> SimpleNamespace:
+    """A state carrying only what curation reads, with optional artifacts."""
+    return SimpleNamespace(
+        goal=SimpleNamespace(description="Settle the invoice batch"),
+        progress=SimpleNamespace(completed=1, total=3, failed=0),
+        evidence=[],
+        findings=[],
+        attempt_lessons=attempt_lessons or [],
+        trajectory_reports=trajectory_reports or [],
+    )
+
+
+def _section(curated: dict[str, Any], prefix: str) -> dict[str, Any]:
+    """The one section whose title starts with ``prefix``."""
+    matches = [s for s in curated["sections"] if s["title"].startswith(prefix)]
+    assert len(matches) == 1, f"expected exactly one {prefix!r} section, got {matches}"
+    return matches[0]
+
+
+def test_attempt_lessons_render_as_a_system_derived_section() -> None:
+    """Lessons the engine derived itself carry the system tier and the issue
+    #313 rationale, never an agent provenance."""
+    state = _state_with(
+        attempt_lessons=[
+            AttemptLesson(
+                attempt_id="att_1",
+                falsified="the vendor list was stale",
+                env_delta="vendors.csv refreshed",
+                scar_action_ids=["act_9"],
+                next_avoid="re-running the match before the refresh lands",
+                source_evidence=["vendors.csv sha mismatch"],
+            )
+        ]
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=state))
+    section = _section(curated, "attempt lessons")
+    assert section["provenance"] == "system"
+    assert section["title"] == "attempt lessons (system-derived)"
+    assert "attempt att_1: the vendor list was stale" in section["lines"]
+    assert "scar actions: act_9" in section["lines"]
+
+
+def test_a_state_without_artifacts_adds_no_system_sections() -> None:
+    """No lessons and no reports means no system-derived sections at all."""
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=_state_with()))
+    titles = [s["title"] for s in curated["sections"]]
+    assert not any(t.startswith("attempt lessons") for t in titles)
+    assert not any(t.startswith("trajectory reports") for t in titles)
+    assert not any(t.startswith("what previous attempts changed") for t in titles)
+
+
+def _trajectory(derived_origin: str) -> TrajectoryReport:
+    return TrajectoryReport(
+        report_id="tr_1",
+        window_start=0,
+        window_end=10,
+        compaction_seq=1,
+        attempts=2,
+        total_attempts=2,
+        uncertain_count=0,
+        scar_rate=0.0,
+        stall_sites=[],
+        top_failure_action_types=[],
+        derived_origin=derived_origin,
+    )
+
+
+def test_a_verified_trajectory_report_renders_as_system() -> None:
+    """A report distilled from trusted history keeps the system tier."""
+    state = _state_with(trajectory_reports=[_trajectory(Origin.DETERMINISTIC.value)])
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=state))
+    section = _section(curated, "trajectory reports")
+    assert section["title"] == "trajectory reports (sleep-time, system-derived)"
+    assert section["provenance"] == "system"
+    assert section["reason"] == "distilled from archived history between sessions (issue #393)"
+
+
+def test_an_unverified_trajectory_report_degrades_to_agent_tier() -> None:
+    """A report distilled from agent-asserted events inherits that trust level
+    (#392 non-amplification): the title says unverified provenance and the
+    tier drops to agent, so the briefing never advertises agent material as
+    trusted system output."""
+    state = _state_with(
+        trajectory_reports=[
+            _trajectory(Origin.EXTERNAL_AGENT.value),
+            _trajectory(Origin.DETERMINISTIC.value),
+        ]
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", _decision(state=state))
+    section = _section(curated, "trajectory reports")
+    assert section["title"].endswith(", unverified provenance")
+    assert section["provenance"] == "agent"
+    assert "issue #392" in section["reason"]
+
+
+def _retry_block(derived_origin: str) -> dict[str, Any]:
+    return {
+        "attempts": 1,
+        "last_attempt_mode": "repair",
+        "last_attempt_steps": ["verify the ledger"],
+        "derived_origin": derived_origin,
+    }
+
+
+def test_a_verified_informed_retry_block_renders_as_system() -> None:
+    decision = _decision()
+    decision.informed_retry = _retry_block(Origin.DETERMINISTIC.value)
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+    section = _section(curated, "what previous attempts changed")
+    assert section["title"] == "what previous attempts changed (engine-recorded)"
+    assert section["provenance"] == "system"
+    assert "previous attempt(s): 1" in section["lines"]
+    assert "  planned then: verify the ledger" in section["lines"]
+
+
+def test_an_unverified_informed_retry_block_degrades_to_agent_tier() -> None:
+    decision = _decision()
+    decision.informed_retry = _retry_block(Origin.EXTERNAL_AGENT.value)
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+    section = _section(curated, "what previous attempts changed")
+    assert section["title"].endswith(", unverified provenance")
+    assert section["provenance"] == "agent"
+    assert "issue #392" in section["reason"]
+
+
+def test_the_contract_reason_renders_as_a_why_line() -> None:
+    decision = _decision()
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+    section = _section(curated, "recovery verdict")
+    assert "why: checkpoint verified" in section["lines"]
+    assert "next permitted action: resume" in section["lines"]
+
+
+def test_an_empty_contract_reason_omits_the_why_line() -> None:
+    """An empty reason leaves the verdict line standing on its own: no empty
+    ``why:`` padding in the sealed contract section."""
+    decision = _decision()
+    decision.contract = RecoveryContract(
+        run_id="run_1",
+        recovery_status=RecoverySafety.SAFE_TO_RESUME,
+        reason="",
+        next_allowed_action="resume",
+    )
+    curated = curate_briefing(_StubStorage([]), "run_1", decision)
+    section = _section(curated, "recovery verdict")
+    assert not any(line.startswith("why:") for line in section["lines"])
+    assert "recovery verdict: resume (safe=True)" in section["lines"]
