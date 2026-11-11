@@ -29,7 +29,11 @@ from continuum.models import (
     ComponentValidationEntry,
     Decision,
     EnvironmentSnapshot,
+    EnvResource,
+    Finding,
     Goal,
+    PlanStep,
+    PlanStepStatus,
     RecoveryMode,
     RecoverySafety,
     Run,
@@ -906,3 +910,103 @@ def test_conformance_rejects_a_rule_whose_evaluate_is_not_callable() -> None:
 
     assert not report.passed
     assert any("no callable 'evaluate' method" in failure for failure in report.failures)
+
+
+# --- the built-in rule's remaining arms, and the environment guard (#2049) ---- #
+
+
+def test_revoked_approvals_with_blank_subjects_are_skipped() -> None:
+    """A revocation that names nothing authorizes nothing: empty and
+    whitespace-only subjects are skipped, and with no subject left indexed
+    the rule reports no findings at all."""
+    state = _state_with(
+        [_revoked("", "approval_blank", None), _revoked("   ", "approval_ws", None)]
+    )
+    assert RevokedApprovalRule().evaluate(state) == []
+
+
+def test_a_revoked_approval_invalidates_the_finding_it_authorized() -> None:
+    """The finding arm of the rule: a revoked approval whose subject names a
+    finding pulls that finding to invalid, namespaced to the rule."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        findings=[Finding(finding_id="finding_1", claim="the report is accurate")],
+        approvals=[_revoked("finding_1", "approval_f", None)],
+    )
+    (entry,) = RevokedApprovalRule().evaluate(state)
+    assert entry.component is Component.FINDING
+    assert entry.component_id == "finding_1"
+    assert entry.status is StateStatus.INVALID
+    assert entry.detail == "authorizing approval approval_f was revoked"
+    assert entry.rule == "builtin:revoked_approval"
+
+
+def test_a_revoked_approval_invalidates_an_outstanding_plan_step() -> None:
+    """The plan arm: work still outstanding is blocked by a lost authorization."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        plan=[PlanStep(step_id="step_1", description="file the report")],
+        approvals=[_revoked("step_1", "approval_s", None)],
+    )
+    (entry,) = RevokedApprovalRule().evaluate(state)
+    assert entry.component is Component.PLAN
+    assert entry.component_id == "step_1"
+    assert entry.status is StateStatus.INVALID
+
+
+def test_a_completed_plan_step_survives_a_revoked_authorization() -> None:
+    """Only work still outstanding can be blocked: a step already completed is
+    not marked invalid by the loss of its authorization."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        plan=[
+            PlanStep(
+                step_id="step_1",
+                description="file the report",
+                status=PlanStepStatus.COMPLETED,
+            )
+        ],
+        approvals=[_revoked("step_1", "approval_s", None)],
+    )
+    assert RevokedApprovalRule().evaluate(state) == []
+
+
+def test_a_decision_that_is_already_not_valid_is_not_re_reported() -> None:
+    """The rule adds caution and nothing else: a decision the fold already
+    graded invalid is not reported a second time."""
+    state = SemanticState(
+        run_id="run_1",
+        goal=Goal(description="g"),
+        decisions=[
+            Decision(
+                decision_id="decision_1", decision="adopt policy P-42", status=StateStatus.INVALID
+            )
+        ],
+        approvals=[_revoked("decision_1", "approval_d", None)],
+    )
+    assert RevokedApprovalRule().evaluate(state) == []
+
+
+def test_conformance_detects_a_rule_that_mutates_the_environment() -> None:
+    """The trust boundary hands a rule the environment to read, not to edit:
+    a rule that writes into it fails conformance with a named failure."""
+    env = EnvironmentSnapshot(run_id="run_1")
+
+    class _EnvMutatingRule:
+        name = "test:env_mutator"
+
+        def evaluate(self, state, environment=None):  # type: ignore[no-untyped-def]
+            if environment is not None:
+                environment.resources["evil"] = EnvResource(name="evil")
+            return []
+
+    report = check_validation_rule(
+        _EnvMutatingRule(),
+        states=[SemanticState(run_id="mine", goal=Goal(description="g"))],
+        environment=env,
+    )
+    assert not report.passed
+    assert any("mutated the environment" in failure for failure in report.failures)
