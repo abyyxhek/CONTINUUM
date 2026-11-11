@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 
 from continuum.actions.ledger import ActionLedger
+from continuum.cli.exitcodes import ExitCode
 from continuum.cli.main import main
 from continuum.events import EventType
 from continuum.models import Run
 from continuum.storage import SQLiteStorage
+from continuum.storage.base import RunNotFound
 
 
 def _run_cli(args: list[str], db: str) -> tuple[int, str, str]:
@@ -190,3 +192,77 @@ def test_forget_fails_gracefully_when_user_cannot_be_determined(
     code = main(["--db", db, "forget", "--tenant", "acme", "--run-id", "run_1"], out=out, err=err)
     assert code != 0
     assert "cannot determine local user; pass --operator" in err.getvalue()
+
+
+def _seed_store_with_memory(db: str) -> None:
+    """Create a run holding one acme memory write so forget has something to enumerate."""
+    with SQLiteStorage(db) as store:
+        store.create_run(Run(run_id="run_1", goal="g"))
+        store.append_event("run_1", EventType.RUN_STARTED, {"goal": "g"})
+        ActionLedger(store, "run_1").claim(
+            "mem_write", {}, key="mem:pgvector_main:acme:rec-1", scoped_to_run=False
+        )
+
+
+def test_forget_json_empty_tenant_error_goes_to_stderr(tmp_path: Path) -> None:
+    """--json promises stdout for machines, so the empty-tenant error must not land there (#2081)."""
+    db = str(tmp_path / "forget_json_tenant.db")
+    _seed_store_with_memory(db)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["--db", db, "--json", "forget", "--tenant", "", "--run-id", "run_1"], out=out, err=err
+    )
+
+    assert code == ExitCode.ERROR
+    assert out.getvalue() == ""
+    assert "--tenant is required and must be non-empty" in err.getvalue()
+
+
+def test_forget_json_unknown_run_error_goes_to_stderr(tmp_path: Path) -> None:
+    """An unknown --run-id under --json reports on stderr and leaves stdout empty (#2081)."""
+    db = str(tmp_path / "forget_json_run.db")
+    _seed_store_with_memory(db)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["--db", db, "--json", "forget", "--tenant", "acme", "--run-id", "typo"],
+        out=out,
+        err=err,
+    )
+
+    assert code == ExitCode.NOT_FOUND
+    assert out.getvalue() == ""
+    assert "no such run: 'typo'" in err.getvalue()
+
+
+def test_forget_json_target_run_error_goes_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tombstone target lookup failing under --json also reports on stderr (#2081)."""
+    db = str(tmp_path / "forget_json_target.db")
+    _seed_store_with_memory(db)
+
+    # The --run-id validation passes, then the tombstone target lookup fails, which is
+    # the second get_run call cmd_forget makes.
+    real_get_run = SQLiteStorage.get_run
+    calls = {"n": 0}
+
+    def _flaky_get_run(self: SQLiteStorage, run_id: str) -> Run:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RunNotFound(run_id)
+        return real_get_run(self, run_id)
+
+    monkeypatch.setattr(SQLiteStorage, "get_run", _flaky_get_run)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["--db", db, "--json", "forget", "--tenant", "acme", "--run-id", "run_1"],
+        out=out,
+        err=err,
+    )
+
+    assert code == ExitCode.NOT_FOUND
+    assert out.getvalue() == ""
+    assert "target run 'run_1' not found" in err.getvalue()

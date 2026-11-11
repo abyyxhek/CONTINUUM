@@ -4736,7 +4736,7 @@ def cmd_forget(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
     """
     tenant = getattr(args, "tenant", None)
     if not tenant or not str(tenant).strip():
-        print("error: --tenant is required and must be non-empty", file=out)
+        print("error: --tenant is required and must be non-empty", file=err)
         return ExitCode.ERROR
     tenant = str(tenant).strip()
     reason = getattr(args, "reason", "") or ""
@@ -4763,7 +4763,7 @@ def cmd_forget(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
         try:
             storage.get_run(run_filter)
         except Exception as exc:
-            print(f"error: {exc}", file=out)
+            print(f"error: {exc}", file=err)
             return ExitCode.NOT_FOUND
     hits = storage.enumerate_tenant_memory(tenant, run_id=run_filter)
     record_keys = {hit["record_key"] for hit in hits}
@@ -4803,7 +4803,7 @@ def cmd_forget(args: argparse.Namespace, storage: Storage, out: Any, err: Any) -
             try:
                 storage.get_run(target_run_id)
             except Exception as exc:
-                print(f"error: target run {target_run_id!r} not found: {exc}", file=out)
+                print(f"error: target run {target_run_id!r} not found: {exc}", file=err)
                 return ExitCode.NOT_FOUND
             # Hashes are kept, plaintext record_keys are in the tombstone payload
             # but the historical chain retains hashes, so verify() stays intact.
