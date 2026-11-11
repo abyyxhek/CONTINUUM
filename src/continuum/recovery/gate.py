@@ -333,6 +333,29 @@ def _filtered_depended_for_edit(
     return restored_set | derived_surviving
 
 
+def _edit_head(storage: Storage, run_id: str, anchor: int, candidate: int | None) -> int:
+    """Head of the edit span ``(anchor, head]`` for ``run_id``.
+
+    ``head`` is the explicit candidate when one is given, else the run's last
+    sequence. An anchor beyond the run's own head describes an edit outside
+    the run's history, so it is refused instead of normalized to an empty
+    span (the residual from #1931): an empty span approves the edit with no
+    preconditions checked. ``anchor == head`` stays legitimate, since a
+    checkpoint covering the head is a real edit point. An explicit candidate
+    below the anchor is the inverted-span case, so the clamp is kept for it
+    and :class:`~continuum.recovery.preconditions.EditPoint` shapes that error.
+    """
+    head = candidate if candidate is not None else storage.last_sequence(run_id)
+    if anchor > head:
+        if candidate is None:
+            raise ValueError(
+                f"anchor sequence {anchor} is beyond run {run_id!r} head {head}; "
+                "an edit must sit inside the run's history"
+            )
+        head = anchor
+    return head
+
+
 def _derive_single(
     storage: Storage,
     run_id: str,
@@ -344,9 +367,7 @@ def _derive_single(
     """Derive a single-run DerivationResult with per-edit filtering applied."""
     from continuum.recovery.preconditions import DerivationResult, EditPoint, derive
 
-    head = candidate if candidate is not None else storage.last_sequence(run_id)
-    if anchor > head:
-        head = anchor
+    head = _edit_head(storage, run_id, anchor, candidate)
     point = EditPoint(
         run_id=run_id,
         anchor_sequence=anchor,
@@ -480,9 +501,7 @@ def check_merge_preconditions(
     """
     from continuum.recovery.preconditions import DerivationResult
 
-    target_head = storage.last_sequence(target_run_id)
-    if target_anchor > target_head:
-        target_head = target_anchor
+    target_head = _edit_head(storage, target_run_id, target_anchor, None)
     target_derivation = _derive_single(
         storage, target_run_id, target_anchor, candidate=target_head, edit_type="merge"
     )
@@ -513,9 +532,7 @@ def check_merge_preconditions(
         source_anchor_val = latest.source_sequence if latest is not None else 0
     else:
         source_anchor_val = int(source_anchor)
-    source_head = storage.last_sequence(source_run_id)
-    if source_anchor_val > source_head:
-        source_head = source_anchor_val
+    source_head = _edit_head(storage, source_run_id, source_anchor_val, None)
     source_derivation = _derive_single(
         storage, source_run_id, source_anchor_val, candidate=source_head, edit_type="merge"
     )
@@ -648,9 +665,7 @@ def check_preconditions(
     """Derive preconditions for ``(anchor, candidate]`` and raise if blocked."""
     from continuum.recovery.preconditions import DerivationResult, EditPoint, derive
 
-    head = candidate if candidate is not None else storage.last_sequence(run_id)
-    if anchor > head:
-        head = anchor
+    head = _edit_head(storage, run_id, anchor, candidate)
     point = EditPoint(
         run_id=run_id,
         anchor_sequence=anchor,
