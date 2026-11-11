@@ -8,6 +8,7 @@ from continuum.replay_similarity import (
     SimilarityConfig,
     SimilarityKind,
     _cosine,
+    _resolve_embedder,
     classify_call,
     jaccard,
     similarity,
@@ -480,3 +481,143 @@ def test_fuzzy_does_not_match_when_values_differ_but_tokenize_to_nothing() -> No
         )
         == 0.0
     )
+
+
+# --- boundary values, exact-key arms, and embedder resolution (#2053) ---------- #
+
+
+def test_jaccard_scores_two_empty_sets_as_one() -> None:
+    """Two empty token sets mean nothing distinguishes the calls, so the
+    score is 1.0 by convention."""
+    assert jaccard(frozenset(), frozenset()) == 1.0
+
+
+def test_jaccard_scores_one_empty_set_as_zero() -> None:
+    """One empty set means nothing is shared, not a perfect match."""
+    assert jaccard(frozenset(), frozenset({"token"})) == 0.0
+    assert jaccard(frozenset({"token"}), frozenset()) == 0.0
+
+
+def test_cosine_returns_zero_when_either_vector_has_no_norm() -> None:
+    """A zero vector has no direction, so the similarity is 0.0 rather than a
+    division-by-zero or a false 1.0."""
+    assert _cosine([0.0, 0.0], [1.0, 2.0]) == 0.0
+    assert _cosine([1.0, 2.0], [0.0, 0.0]) == 0.0
+
+
+def test_similarity_raises_when_the_embedding_kind_has_no_embedder() -> None:
+    """The embedding backend is caller-supplied by design: CONTINUUM bundles no
+    model, so asking for it without a function fails loudly at scoring time."""
+    with pytest.raises(ValueError, match="EMBEDDING kind requires an embedder function"):
+        similarity({"a": 1}, {"a": 1}, SimilarityConfig(kind="embedding"))
+
+
+def _exact_key(new_key: str, run_id: str = "run_1") -> str:
+    from continuum.actions.idempotency import idempotency_key
+
+    return str(idempotency_key("send_invoice", None, scope=run_id, key=new_key))
+
+
+def test_an_exact_key_hit_on_a_completed_prior_is_a_replay() -> None:
+    """The deduplication short-circuit: the exact ledger key is present and
+    completed, so the call is a replay of that very action."""
+    exact = _exact_key("invoice:1")
+    prior = {
+        exact: {
+            "action_type": "send_invoice",
+            "status": "completed",
+            "arguments": {"invoice": "INV-001"},
+        }
+    }
+    kind, match = classify_call(
+        new_key="invoice:1",
+        new_args={},
+        action_type="send_invoice",
+        prior_actions=prior,
+        config=SimilarityConfig(),
+        run_id="run_1",
+    )
+    assert kind == "replay"
+    assert match is prior[exact]
+
+
+@pytest.mark.parametrize("status", ["failed", "running", "unknown"])
+def test_an_exact_key_hit_on_a_non_completed_prior_is_fresh(status: str) -> None:
+    """A prior attempt under the same key that did not finish cannot supply a
+    cached result, so the call runs again."""
+    prior = {
+        _exact_key("invoice:1"): {
+            "action_type": "send_invoice",
+            "status": status,
+            "arguments": {"invoice": "INV-001"},
+        }
+    }
+    kind, match = classify_call(
+        new_key="invoice:1",
+        new_args={},
+        action_type="send_invoice",
+        prior_actions=prior,
+        config=SimilarityConfig(),
+        run_id="run_1",
+    )
+    assert kind == "fresh"
+    assert match is None
+
+
+def test_a_near_miss_between_the_thresholds_is_a_fork() -> None:
+    """A score above the fork band but below the replay band is a divergent
+    call that must be handled as a fork, not replayed."""
+    cfg = SimilarityConfig(kind="fuzzy", replay_threshold=0.90, fork_threshold=0.50)
+    kind, match = classify_call(
+        new_key="invoice:2",
+        new_args={"note": "pay invoice INV-002 for acme"},
+        action_type="send_invoice",
+        prior_actions={
+            "k1": {
+                "action_type": "send_invoice",
+                "status": "completed",
+                "arguments": {"note": "pay invoice INV-001 for acme"},
+            }
+        },
+        config=cfg,
+        run_id="run_1",
+    )
+    assert kind == "fork"
+    assert match is not None
+    assert match["__ledger_key__"] == "k1"
+
+
+def test_resolve_embedder_returns_a_callable_as_is() -> None:
+    def embed(text: str) -> list[float]:
+        return [1.0]
+
+    assert _resolve_embedder(embed) is embed
+
+
+def test_resolve_embedder_rejects_a_non_string_non_callable() -> None:
+    with pytest.raises(ValueError, match="embedder must be a dotted path or callable, got int"):
+        _resolve_embedder(123)
+
+
+@pytest.mark.parametrize("bad", ["invalidpath", "math"])
+def test_resolve_embedder_rejects_a_path_without_both_halves(bad: str) -> None:
+    """A bare word has neither a module half nor an attribute half."""
+    with pytest.raises(ValueError, match="must be a dotted path like"):
+        _resolve_embedder(bad)
+
+
+def test_resolve_embedder_reports_an_unresolvable_module() -> None:
+    with pytest.raises(ValueError, match="cannot resolve embedder"):
+        _resolve_embedder("nonexistent.mod:fn")
+
+
+def test_resolve_embedder_rejects_a_resolved_non_callable() -> None:
+    with pytest.raises(ValueError, match="is not callable"):
+        _resolve_embedder("math:pi")
+
+
+def test_similarity_backend_rejects_an_unexpected_config_type() -> None:
+    with pytest.raises(
+        ValueError, match="similarity config must be a name, mapping or SimilarityConfig"
+    ):
+        similarity_backend([1, 2, 3])
