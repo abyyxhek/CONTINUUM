@@ -19,7 +19,7 @@ from continuum.events import EventType
 from continuum.models import Origin, Run
 from continuum.recovery import RecoveryEngine, render_contract
 from continuum.recovery.contract import verify_contract
-from continuum.recovery.observations import collect_observations
+from continuum.recovery.observations import collect_observations, observation_status
 from continuum.storage import SQLiteStorage
 
 
@@ -277,3 +277,106 @@ ExitCodes_OK_UNSAFE = {
     ExitCode.REQUIRES_REPAIR,
     ExitCode.UNSAFE,
 }
+
+
+# --- status string and malformed-payload guards (issue #2046) ------------------- #
+
+
+def test_observation_status_without_an_expected_sha_is_recorded(tmp_path: Path) -> None:
+    """No digest to compare against means the file's presence is all the
+    observation can certify, so it reads as recorded rather than verified."""
+    f = tmp_path / "recorded.txt"
+    f.write_bytes(b"body")
+    assert observation_status(str(f), None, 4) == "recorded"
+
+
+def test_observation_status_reports_a_digest_mismatch_as_changed(tmp_path: Path) -> None:
+    f = tmp_path / "digest.txt"
+    f.write_bytes(b"actual body")
+    assert observation_status(str(f), "0" * 64, len("actual body")) == "changed"
+
+
+def test_collect_observations_resolves_relative_paths_against_root(
+    db: str, workspace: Path
+) -> None:
+    """A hook that records a relative path is resolved against the run's root
+    directory, not the process cwd, so the disk check still finds the file."""
+    make_run(db, checkpointed=False)
+    (workspace / "rel.txt").write_text("rel body")
+    with SQLiteStorage(db) as store:
+        store.append_event(
+            "run_1",
+            EventType.TOOL_COMPLETED,
+            {
+                "tool": "Write",
+                "path": "rel.txt",
+                "bytes": 8,
+                "sha256": hashlib.sha256(b"rel body").hexdigest(),
+            },
+            source=Origin.EXTERNAL_AGENT,
+        )
+
+    entries = collect_observations(SQLiteStorage(db), "run_1", after_sequence=0, root=workspace)
+    assert len(entries) == 1
+    assert entries[0]["path"] == "rel.txt"
+    assert entries[0]["status"] == "verified"
+
+
+def test_collect_observations_skips_malformed_events(db: str, workspace: Path) -> None:
+    """A malformed event is skipped cleanly: no entry, no exception, no crash
+    of the assess path that reads the projection."""
+    make_run(db, checkpointed=False)
+    good = workspace / "good.txt"
+    good.write_text("ok")
+    with SQLiteStorage(db) as store:
+        store.append_event(
+            "run_1",
+            EventType.TOOL_COMPLETED,
+            {
+                "tool": "Write",
+                "path": "good.txt",
+                "bytes": 2,
+                "sha256": hashlib.sha256(b"ok").hexdigest(),
+            },
+            source=Origin.EXTERNAL_AGENT,
+        )
+        for bad_payload in (
+            {"path": "x.txt", "bytes": 1},  # missing tool
+            {"tool": "Write", "path": ""},  # empty path
+            {"tool": "Write", "path": 42},  # non-string path
+            {"tool": None, "path": "x.txt"},  # non-string tool
+            {"tool": 1, "path": 2},  # neither field is a string
+        ):
+            store.append_event(
+                "run_1",
+                EventType.TOOL_COMPLETED,
+                bad_payload,
+                source=Origin.EXTERNAL_AGENT,
+            )
+
+    entries = collect_observations(SQLiteStorage(db), "run_1", after_sequence=0, root=workspace)
+    assert len(entries) == 1
+    assert entries[0]["path"] == "good.txt"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"tool": "Write", "path": "f.txt"},  # neither digest nor byte count
+        {"tool": "Write", "path": "f.txt", "sha256": 123},  # non-string digest
+        {"tool": "Write", "path": "f.txt", "bytes": "4"},  # non-int byte count
+    ],
+)
+def test_an_observation_with_no_resolvable_digest_is_unresolvable(
+    db: str, workspace: Path, payload: dict
+) -> None:
+    """Nothing was recorded that could be checked against disk, so the entry
+    says unresolvable rather than silently reporting verified or missing."""
+    make_run(db, checkpointed=False)
+    (workspace / "f.txt").write_text("body")
+    with SQLiteStorage(db) as store:
+        store.append_event("run_1", EventType.TOOL_COMPLETED, payload, source=Origin.EXTERNAL_AGENT)
+
+    entries = collect_observations(SQLiteStorage(db), "run_1", after_sequence=0, root=workspace)
+    assert len(entries) == 1
+    assert entries[0]["status"] == "unresolvable"
