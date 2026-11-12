@@ -23,10 +23,24 @@ from continuum.storage import SQLiteStorage
 RUN_ID = "r1"
 
 
-def _storage() -> SQLiteStorage:
+def _storage(head: int = 1) -> SQLiteStorage:
+    """A run whose log has advanced to ``head``.
+
+    The started record lands at sequence 1 and perception events advance the
+    log, so an anchor resolved from a later checkpoint sits inside the run's
+    history rather than beyond it: the gate refuses an anchor past the head
+    instead of normalizing it away (#2089), so a checkpoint claiming a
+    sequence the log never reached is a refusal, not a fixture.
+    """
     storage = SQLiteStorage(":memory:")
     storage.create_run(Run(run_id=RUN_ID, goal="g"))
     storage.append_event(RUN_ID, EventType.RUN_STARTED, {"goal": "g"})
+    while storage.last_sequence(RUN_ID) < head:
+        storage.append_event(
+            RUN_ID,
+            EventType.PERCEPTION_OBSERVED,
+            {"content_hash": f"target-resolution-{storage.last_sequence(RUN_ID)}"},
+        )
     return storage
 
 
@@ -109,21 +123,21 @@ def test_no_target_resolves_to_the_latest_checkpoint() -> None:
 
 
 def test_target_as_checkpoint_id_resolves() -> None:
-    storage = _storage()
+    storage = _storage(head=4)
     checkpoint_id = _put_checkpoint(storage, version=1, sequence=4)
     approve_restore(storage, RUN_ID, reason="rollback", target=checkpoint_id)
     assert _restored_anchor(storage) == 4
 
 
 def test_target_as_version_resolves() -> None:
-    storage = _storage()
+    storage = _storage(head=4)
     _put_checkpoint(storage, version=7, sequence=4)
     approve_restore(storage, RUN_ID, reason="rollback", target=7)
     assert _restored_anchor(storage) == 4
 
 
 def test_target_as_source_sequence_resolves() -> None:
-    storage = _storage()
+    storage = _storage(head=9)
     _put_checkpoint(storage, version=1, sequence=9)
     approve_restore(storage, RUN_ID, reason="rollback", target=9)
     assert _restored_anchor(storage) == 9
@@ -131,7 +145,7 @@ def test_target_as_source_sequence_resolves() -> None:
 
 def test_target_as_a_numeric_string_falls_through_to_version() -> None:
     """A bare number is not a checkpoint id, so it must reach the number rungs."""
-    storage = _storage()
+    storage = _storage(head=4)
     _put_checkpoint(storage, version=7, sequence=4)
     approve_restore(storage, RUN_ID, reason="rollback", target="7")
     assert _restored_anchor(storage) == 4
