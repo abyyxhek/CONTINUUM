@@ -1208,7 +1208,11 @@ class ActionLedger:
                     update={"status": ActionStatus.UNKNOWN, "side_effect_uncertain": True}
                 )
                 with suppress(ConcurrentWriteError):
-                    self._record(refolded.key, uncertain)
+                    # The marking carries the head we folded against, so a
+                    # log that has moved on (the winner settled between our
+                    # fold and this append) rejects the write instead of
+                    # letting UNKNOWN clobber a recorded outcome (#1889).
+                    self._record(refolded.key, uncertain, expected_sequence=refolded.head_sequence)
                 raise UnknownSideEffect(
                     f"action {winning.action_type!r} (key {refolded.key[:12]}...) was interrupted before its "
                     f"outcome was recorded; the side effect may or may not have occurred. "
@@ -1653,7 +1657,11 @@ class ActionLedger:
                     update={"status": ActionStatus.UNKNOWN, "side_effect_uncertain": True}
                 )
                 with suppress(ConcurrentWriteError):
-                    self._record(key, uncertain)
+                    # Guarded by the folded head, as every other claim write is:
+                    # if the holder settled between our fold and this append,
+                    # the marking must be dropped rather than overwrite a
+                    # recorded outcome with "uncertain" (#1889).
+                    self._record(key, uncertain, expected_sequence=resolved.head_sequence)
                 raise UnknownSideEffect(
                     f"action {existing.action_type!r} (key {key[:12]}...) was interrupted before its "
                     f"outcome was recorded; the side effect may or may not have occurred. "

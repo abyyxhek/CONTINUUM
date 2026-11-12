@@ -83,7 +83,7 @@ notices.
 
 ### Interfaces
 
-- **CLI** (`cli/`), 55 commands at `main` (`111afcb3`, recounted on 2026-10-28
+- **CLI** (`cli/`), 56 commands at `main` (`2a310f73`, recounted on 2026-11-07
   by enumerating the built parser's subparser choices), stdlib `argparse` only.
   Exit codes are a
   safety contract: only a verified-safe run exits `0`, so
