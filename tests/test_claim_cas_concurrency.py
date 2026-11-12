@@ -155,6 +155,153 @@ def test_claim_losing_the_race_does_not_open_a_second_slot(
     assert store.verify_events("run_cas").ok
 
 
+def test_uncertain_marking_after_refold_does_not_clobber_a_settled_winner(
+    two_workers: tuple[Any, ...],
+) -> None:
+    """The winner settles between B's re-fold and B's marking; the marking must be dropped.
+
+    ``_handle_claim_conflict`` re-folds, sees the winner is still STARTED, and
+    appends an UNKNOWN marking. That marking must ride on the head the re-fold
+    observed: if the winner completed in between, an unguarded append leaves
+    the log's final status UNKNOWN even though the side effect settled, which
+    is the red CI race in ``test_64_threads_racing_claim_zero_duplicates``
+    (issue #1889).
+    """
+    store, ledger_a, ledger_b = two_workers
+    real_resolve_claim = ledger_b.resolve_claim
+
+    b_resolutions = 0
+    b_folded = threading.Event()
+    a_recorded = threading.Event()
+    b_refolded = threading.Event()
+    a_completed = threading.Event()
+
+    def b_resolve_claim(action_type: str, arguments: Any = None, **kwargs: Any) -> Any:
+        """Gate each fold so the completion lands between the re-fold and the marking."""
+        nonlocal b_resolutions
+        resolution = real_resolve_claim(action_type, arguments, **kwargs)
+        b_resolutions += 1
+        if b_resolutions == 1:
+            b_folded.set()
+            assert a_recorded.wait(timeout=30), "worker A never recorded its claim"
+        elif b_resolutions == 2:
+            b_refolded.set()
+            assert a_completed.wait(timeout=30), "worker A never settled"
+        return resolution
+
+    ledger_b.resolve_claim = b_resolve_claim  # type: ignore[method-assign]
+
+    results: dict[str, Any] = {}
+
+    def worker_a() -> None:
+        assert b_folded.wait(timeout=30), "worker B never folded the log"
+        outcome = ledger_a.claim("charge_card", {"amount": 10})
+        assert outcome.fresh, "A wins the race and must hold the only fresh slot"
+        a_recorded.set()
+        assert b_refolded.wait(timeout=30), "worker B never re-folded against the winner"
+        ledger_a.complete(outcome.key, result={"tx_id": "tx-a"})
+        a_completed.set()
+        results["a"] = "settled"
+
+    def worker_b() -> None:
+        try:
+            results["b"] = ledger_b.claim("charge_card", {"amount": 10})
+        except UnknownSideEffect as exc:
+            results["b"] = exc
+
+    thread_a = threading.Thread(target=worker_a)
+    thread_b = threading.Thread(target=worker_b)
+    thread_b.start()
+    thread_a.start()
+    thread_a.join(timeout=60)
+    thread_b.join(timeout=60)
+    assert not thread_a.is_alive() and not thread_b.is_alive(), "claim workers deadlocked"
+
+    assert results["a"] == "settled", "worker A never settled its claim"
+    assert isinstance(results["b"], UnknownSideEffect), (
+        f"B must defer to the winning claim, not open a second slot (got {results['b']!r})"
+    )
+
+    actions = ledger_a.all()
+    assert len(actions) == 1
+    assert actions[0].status is ActionStatus.COMPLETED, (
+        "the settled outcome must survive B's stale marking"
+    )
+    assert actions[0].result is not None and actions[0].result["tx_id"] == "tx-a"
+    assert store.verify_events("run_cas").ok
+
+
+def test_uncertain_marking_of_an_in_flight_attempt_survives_completion(
+    two_workers: tuple[Any, ...],
+) -> None:
+    """An in-flight attempt's UNKNOWN marking must not overwrite a completion landing first.
+
+    The straight-line path (no CAS loss) folds an existing STARTED attempt and
+    marks it uncertain. That marking is guarded by the folded head exactly as
+    the claim records are: a completion settling between the fold and the
+    marking must drop the marking, so the final status stays COMPLETED rather
+    than regressing to UNKNOWN (issue #1889).
+    """
+    store, ledger_a, ledger_b = two_workers
+    real_record = ledger_b._record
+    a_claimed = threading.Event()
+    b_folded = threading.Event()
+    a_completed = threading.Event()
+
+    def b_record(key: str, action: Any, *args: Any, **kwargs: Any) -> Any:
+        """Hold the UNKNOWN marking open until A has settled, so B's view is stale.
+
+        Every other record (the claim append, reconciliations) passes straight
+        through; only the marking is gated, which widens exactly the window
+        the folded-head guard is meant to close.
+        """
+        if action.status is ActionStatus.UNKNOWN:
+            b_folded.set()
+            assert a_completed.wait(timeout=30), "worker A never settled"
+        return real_record(key, action, *args, **kwargs)
+
+    ledger_b._record = b_record  # type: ignore[method-assign]
+
+    results: dict[str, Any] = {}
+
+    def worker_a() -> None:
+        outcome = ledger_a.claim("charge_card", {"amount": 10})
+        assert outcome.fresh, "A holds the in-flight attempt"
+        a_claimed.set()
+        assert b_folded.wait(timeout=30), "worker B never folded the log"
+        ledger_a.complete(outcome.key, result={"tx_id": "tx-a"})
+        a_completed.set()
+        results["a"] = "settled"
+
+    def worker_b() -> None:
+        assert a_claimed.wait(timeout=30), "worker A never claimed the in-flight attempt"
+        try:
+            results["b"] = ledger_b.claim("charge_card", {"amount": 10})
+        except UnknownSideEffect as exc:
+            results["b"] = exc
+
+    thread_a = threading.Thread(target=worker_a)
+    thread_b = threading.Thread(target=worker_b)
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=60)
+    thread_b.join(timeout=60)
+    assert not thread_a.is_alive() and not thread_b.is_alive(), "claim workers deadlocked"
+
+    assert results["a"] == "settled", "worker A never settled its claim"
+    assert isinstance(results["b"], UnknownSideEffect), (
+        f"B must defer to the in-flight attempt, not open a second slot (got {results['b']!r})"
+    )
+
+    actions = ledger_a.all()
+    assert len(actions) == 1
+    assert actions[0].status is ActionStatus.COMPLETED, (
+        "the settled outcome must survive B's stale marking"
+    )
+    assert actions[0].result is not None and actions[0].result["tx_id"] == "tx-a"
+    assert store.verify_events("run_cas").ok
+
+
 def test_unrelated_concurrent_write_is_retried_not_reported_as_conflict(
     two_workers: tuple[Any, ...],
 ) -> None:
