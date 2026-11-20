@@ -660,16 +660,20 @@ def render_report(report: DoctorReport) -> str:
     lines = ["CONTINUUM doctor: is CONTINUUM actually wired up here?", ""]
     for ide in report.ides:
         lines.append(f"{ide.ide:<{_WIDTH}} {ide.surface:<13} {ide.state:<20} {ide.summary}")
-        if ide.unresolved or ide.stale or ide.degraded or ide.state in (
-            STALE,
-            DEGRADED,
-            f"{STALE}+{DEGRADED}",
-            UNRESOLVED,
+        if (
+            ide.unresolved
+            or ide.stale
+            or ide.degraded
+            or ide.state
+            in (
+                STALE,
+                DEGRADED,
+                f"{STALE}+{DEGRADED}",
+                UNRESOLVED,
+            )
         ):
             for detail in ide.details:
-                if ide.surface == "hooks" and not (
-                    "read-only" in detail or "bakes" in detail
-                ):
+                if ide.surface == "hooks" and not ("read-only" in detail or "bakes" in detail):
                     continue
                 lines.append(f"{'':<{_WIDTH}} -> {detail}")
             if ide.remedy:

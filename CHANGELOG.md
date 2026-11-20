@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Test counts: ~4400 collected on a minimal env.
+Test counts: ~4800 collected on a minimal env.
 
 ### Added
 
