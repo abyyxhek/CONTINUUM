@@ -1254,11 +1254,14 @@ def cmd_watch(args: argparse.Namespace, storage: Storage, out: Any, err: Any) ->
         "breached": breached,
         "liveness": advisory,
     }
-    text = (
-        _liveness_text(advisory)
-        if breached
-        else f"Liveness ok for {run_id}: {advisory.get('silence_seconds')}"
-    )
+    if breached:
+        text = _liveness_text(advisory)
+    else:
+        silence = advisory.get("silence_seconds")
+        if silence is None:
+            text = f"Liveness ok for {run_id}: no events yet, no silence to evaluate."
+        else:
+            text = f"Liveness ok for {run_id}: {silence:.1f}s"
     if breached and on_breach == "webhook" and webhook_url:
         from continuum.recovery.notify import post_webhook
 
@@ -2887,8 +2890,13 @@ def cmd_briefing(args: argparse.Namespace, storage: Storage, out: Any, err: Any)
         and getattr(args, "hook_event_name", "SessionStart") == "SessionStart"
         and not resume_path.exists()
     ):
-        # Silent when no interrupted run, as required for token floor.
-        return ExitCode.OK
+        try:
+            interactive = sys.stdin.isatty()
+        except Exception:
+            interactive = False
+        if not interactive:
+            # Silent when no interrupted run, as required for token floor.
+            return ExitCode.OK
 
     # The file was written on the last checkpoint. Read it once and validate
     # the run it names before anything is surfaced: a stale file must not
@@ -6632,7 +6640,12 @@ def main(
     if args.command == "briefing" and not getattr(args, "run_id", None):
         hook_name = getattr(args, "hook_event_name", "SessionStart")
         if hook_name == "SessionStart" and not Path(".continuum/resume.json").exists():
-            return ExitCode.OK
+            try:
+                interactive = sys.stdin.isatty()
+            except Exception:
+                interactive = False
+            if not interactive:
+                return ExitCode.OK
 
     try:
         storage = open_storage(args.db)
