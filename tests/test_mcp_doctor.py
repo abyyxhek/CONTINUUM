@@ -191,7 +191,10 @@ def test_scripts_dir_follows_the_venv_not_the_symlink(monkeypatch: Any, tmp_path
     venv_bin = tmp_path / "venv" / _SCRIPTS_SUBDIR
     venv_bin.mkdir(parents=True)
     venv_python = venv_bin / "python"
-    venv_python.symlink_to(sys.executable)
+    try:
+        venv_python.symlink_to(sys.executable)
+    except OSError:
+        pytest.skip("symlinks not supported in this environment")
 
     monkeypatch.setattr(sys, "executable", str(venv_python))
     monkeypatch.setattr(
